@@ -92,6 +92,37 @@ fn give_back(buffers: impl IntoIterator<Item = Box<[u8]>>) {
     }
 }
 
+/// Ranges of at least this many bytes per thread are copied or compared on
+/// several threads.
+const PARALLEL_MIN: usize = 4 << 20;
+
+fn copy_workers() -> usize {
+    crate::pool::workers()
+}
+
+/// Runs copies `(destination, source, length)` (addresses; disjoint
+/// destinations, sources not written meanwhile), on several threads when
+/// they total a lot.
+fn run_copies(jobs: &[(usize, usize, usize)]) {
+    let total: usize = jobs.iter().map(|j| j.2).sum();
+    let run = |jobs: &[(usize, usize, usize)]| {
+        for &(dst, src, n) in jobs {
+            // SAFETY: the caller's disjoint buffers of `n` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, n) };
+        }
+    };
+    let workers = copy_workers().min(total / PARALLEL_MIN).min(jobs.len());
+    if workers < 2 {
+        return run(jobs);
+    }
+    let per = jobs.len().div_ceil(workers);
+    let tasks: Vec<Box<dyn FnOnce() + Send + '_>> = jobs
+        .chunks(per)
+        .map(|chunk| Box::new(move || run(chunk)) as Box<dyn FnOnce() + Send + '_>)
+        .collect();
+    crate::pool::run_all(tasks);
+}
+
 const NOT_WATCHED: u8 = 2;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
@@ -172,11 +203,6 @@ impl Shadow {
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        // In-page offsets `[a, b)` of `page`, from the copy.
-        // SAFETY: inside the mapping (the caller passes offsets in the buffer).
-        let host = |page: usize, a: usize, b: usize| unsafe {
-            std::slice::from_raw_parts(self.data.add(page * PAGE + a - start), b - a)
-        };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let before = &mut *before;
         if from >= to || before.spans.iter().any(|&(a, b)| a <= from && to <= b) {
@@ -191,6 +217,9 @@ impl Shadow {
             !meets
         });
         before.spans.push((a, b));
+        // The copies are noted first and run together, in parallel for a
+        // big range: a world submission snapshots hundreds of MB.
+        let mut jobs: Vec<(usize, usize, usize)> = Vec::new();
         let mut at = from;
         while at < to {
             let (page, lo) = ((start + at) / PAGE, (start + at) % PAGE);
@@ -200,17 +229,21 @@ impl Shadow {
                 hi: lo,
                 bytes: page_buffer(),
             });
+            let bytes = snap.bytes.as_mut_ptr() as usize;
+            // The copy's page start (as an address).
+            let page_in_copy = self.data as usize + page * PAGE - start;
             if lo < snap.lo {
-                snap.bytes[lo..snap.lo].copy_from_slice(host(page, lo, snap.lo));
+                jobs.push((bytes + lo, page_in_copy + lo, snap.lo - lo));
                 snap.lo = lo;
             }
             if hi > snap.hi {
                 let from = snap.hi.max(snap.lo);
-                snap.bytes[from..hi].copy_from_slice(host(page, from, hi));
+                jobs.push((bytes + from, page_in_copy + from, hi - from));
                 snap.hi = hi;
             }
             at += hi - lo;
         }
+        run_copies(&jobs);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -226,48 +259,8 @@ impl Shadow {
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
         if from < to {
-            // By title page: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
-            let mut scratch = page_buffer();
-            let mut synced = Vec::new();
-            let mut at = from;
-            while at < to {
-                let (page, lo) = ((start + at) / PAGE, (start + at) % PAGE);
-                let n = (PAGE - lo).min(to - at);
-                let Some(snap) = snapshot
-                    .pages
-                    .get(&page)
-                    .filter(|s| s.lo <= lo && lo + n <= s.hi)
-                else {
-                    at += n;
-                    continue;
-                };
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &snap.bytes[lo..lo + n];
-                let title = &mut scratch[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
-                }
-                at += n;
-            }
-            give_back([scratch]);
+            let (bytes, synced) = self.sync_pages_parallel(&snapshot.pages, from, to);
+            written += bytes;
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
@@ -293,6 +286,106 @@ impl Shadow {
             give_back(taken.pages.into_values().map(|s| s.bytes));
         }
         written
+    }
+
+    /// [`Shadow::sync_pages`] of `[from, to)`, cut at page boundaries and
+    /// run on several threads when the range is big (the compare of the
+    /// copy with its snapshot reads every page the GPU may have written).
+    fn sync_pages_parallel(
+        &self,
+        pages: &BTreeMap<usize, Snap>,
+        from: usize,
+        to: usize,
+    ) -> (usize, Vec<usize>) {
+        let workers = copy_workers().min((to - from) / PARALLEL_MIN);
+        if workers < 2 {
+            return self.sync_pages(pages, from, to);
+        }
+        let start = self.start as usize;
+        let edge = |k: usize| {
+            if k == 0 {
+                return from;
+            }
+            if k == workers {
+                return to;
+            }
+            let at = (start + from + (to - from) * k / workers).next_multiple_of(PAGE) - start;
+            at.clamp(from, to)
+        };
+        let parts: Vec<(usize, usize)> = (0..workers).map(|k| (edge(k), edge(k + 1))).collect();
+        let results: Mutex<Vec<(usize, (usize, Vec<usize>))>> = Mutex::new(Vec::new());
+        let tasks: Vec<Box<dyn FnOnce() + Send + '_>> = parts
+            .iter()
+            .enumerate()
+            .map(|(k, &(a, b))| {
+                let results = &results;
+                Box::new(move || {
+                    let r = self.sync_pages(pages, a, b);
+                    results.lock().unwrap_or_else(|e| e.into_inner()).push((k, r));
+                }) as Box<dyn FnOnce() + Send + '_>
+            })
+            .collect();
+        crate::pool::run_all(tasks);
+        let mut results = results.into_inner().unwrap_or_else(|e| e.into_inner());
+        results.sort_by_key(|&(k, _)| k);
+        let results: Vec<(usize, Vec<usize>)> = results.into_iter().map(|(_, r)| r).collect();
+        let mut synced = Vec::new();
+        let mut written = 0;
+        for (w, s) in results {
+            written += w;
+            synced.extend(s);
+        }
+        (written, synced)
+    }
+
+    /// The pages of `[from, to)` (offsets in the copy) put in step: the
+    /// bytes shaders wrote go to title memory, the title's own writes to
+    /// the copy. Returns the bytes written to title memory and the pages
+    /// made equal.
+    fn sync_pages(
+        &self,
+        pages: &BTreeMap<usize, Snap>,
+        from: usize,
+        to: usize,
+    ) -> (usize, Vec<usize>) {
+        let start = self.start as usize;
+        let mut written = 0;
+        let mut scratch = page_buffer();
+        let mut synced = Vec::new();
+        let mut at = from;
+        while at < to {
+            let (page, lo) = ((start + at) / PAGE, (start + at) % PAGE);
+            let n = (PAGE - lo).min(to - at);
+            let Some(snap) = pages.get(&page).filter(|s| s.lo <= lo && lo + n <= s.hi) else {
+                at += n;
+                continue;
+            };
+            // SAFETY: inside the mapping; each thread has its own pages.
+            let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+            let old = &snap.bytes[lo..lo + n];
+            let title = &mut scratch[..n];
+            if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                // Title memory with the GPU's bytes put in; the copy
+                // takes the title's bytes in turn.
+                let mut changed = false;
+                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                    if *h != *o && *t != *h {
+                        *t = *h;
+                        changed = true;
+                    }
+                    *h = *t;
+                }
+                if changed {
+                    crate::watch::writing(start + at, n);
+                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    written += n;
+                }
+                synced.push((start + at) / PAGE);
+            }
+            at += n;
+        }
+        give_back([scratch]);
+        (written, synced)
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -618,6 +711,39 @@ mod tests {
         shadow.copy_back(base + 4, 100);
         // SAFETY: title memory of ours.
         assert_eq!(unsafe { (base as *const u8).add(5).read() }, 9);
+        assert!(shadow.before.lock().unwrap().pages.is_empty());
+        drop(memory);
+    }
+
+    /// A range big enough to be snapshotted and compared on several
+    /// threads gives the same result as a small one: the GPU's bytes go
+    /// back wherever they are, the title's own writes stay.
+    #[test]
+    fn a_big_range_is_snapshotted_and_copied_back_in_parallel() {
+        const LEN: usize = 24 << 20;
+        let mut memory = vec![1u8; LEN + PAGE];
+        let base = (memory.as_mut_ptr() as usize).next_multiple_of(PAGE);
+        let Some(shadow) = shadow_of(base, LEN) else {
+            return;
+        };
+        shadow.writing(base, LEN);
+        let marks = [5, 3 << 20, 9 << 20, 17 << 20, LEN - 1];
+        // SAFETY: bytes of the title range and the copy, which nothing else uses.
+        unsafe {
+            for &at in &marks {
+                shadow.data.add(at).write(0xee);
+            }
+            (base as *mut u8).add((3 << 20) + 10).write(0x77);
+        }
+        assert!(shadow.copy_back(base, LEN) > 0);
+        // SAFETY: as above.
+        unsafe {
+            for &at in &marks {
+                assert_eq!((base as *const u8).add(at).read(), 0xee, "GPU byte at {at}");
+            }
+            assert_eq!((base as *const u8).add((3 << 20) + 10).read(), 0x77);
+            assert_eq!(shadow.data.add((3 << 20) + 10).read(), 0x77, "the copy takes it");
+        }
         assert!(shadow.before.lock().unwrap().pages.is_empty());
         drop(memory);
     }

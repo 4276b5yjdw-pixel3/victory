@@ -1529,6 +1529,7 @@ struct Meter {
 
 impl Meter {
     fn new() -> Self {
+        crate::pool::start();
         #[cfg(feature = "diagnostics")]
         crate::profile::start();
         let now = std::time::Instant::now();
