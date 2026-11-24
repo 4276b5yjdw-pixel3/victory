@@ -924,6 +924,13 @@ struct Heap {
     memory: Memory,
 }
 
+impl Drop for Heap {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        crate::shadow::unregister_heap(self.memory.ptr.as_ptr() as u64);
+    }
+}
+
 pub(crate) extern "system" fn create_heap(
     _: This,
     desc: *const HeapDesc,
@@ -951,6 +958,8 @@ pub(crate) extern "system" fn create_heap(
         Ok(memory) => memory,
         Err(hr) => return hr,
     };
+    #[cfg(windows)]
+    crate::shadow::register_heap(memory.ptr.as_ptr() as u64, desc.size);
     let heap = Box::new(Heap {
         object: Object::new(&HEAP_FUNCTIONS),
         desc,

@@ -444,15 +444,29 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     }
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
+    let Some(key) = containing(&map, address, end) else {
         drop(map);
-        return loose(address, end);
+        if let Some((start, bytes)) = heap_containing(address, end) {
+            // A heap the title holds is a buffer of its own: its copy covers
+            // the view, wherever in the heap the view starts.
+            buffers().insert(
+                (start, start as usize),
+                Entry {
+                    end: start + bytes,
+                    shadow: None,
+                },
+            );
+            resolved_through_heap(address, start);
+            return find(address, len);
+        }
+        let copy = loose(address, end);
+        if copy.is_none() && missing_once(address) {
+            tracing::warn!(
+                address = format_args!("{address:#x}"),
+                "root view address still host None: no buffer, heap or committed memory holds it"
+            );
+        }
+        return copy;
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -479,6 +493,83 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len)));
     }
     entry.shadow.clone()
+}
+
+/// The key of the registered buffer holding `[address, end)`: the nearest
+/// one first (the common case, a view near its buffer's start), then any
+/// earlier one (a view deep in a large buffer past its nearest neighbours).
+fn containing(map: &BTreeMap<(u64, usize), Entry>, address: u64, end: u64) -> Option<(u64, usize)> {
+    let below = map.range(..=(address, usize::MAX));
+    below
+        .clone()
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .or_else(|| below.rev().find(|(_, e)| e.end >= end))
+        .map(|(k, _)| *k)
+}
+
+/// Heaps the title holds (start, bytes), by start: memory of ours a view
+/// may name without a buffer of its own.
+static HEAPS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+/// A heap of `bytes` at `start` (its memory of ours) is held.
+pub(crate) fn register_heap(start: u64, bytes: u64) {
+    HEAPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(start, bytes);
+}
+
+/// The heap at `start` is gone: its buffer entry goes with it.
+pub(crate) fn unregister_heap(start: u64) {
+    HEAPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&start);
+    buffers().remove(&(start, start as usize));
+}
+
+/// The held heap (start, bytes) that contains `[address, end)`.
+fn heap_containing(address: u64, end: u64) -> Option<(u64, u64)> {
+    let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    heap_in(&heaps, address, end)
+}
+
+fn heap_in(heaps: &BTreeMap<u64, u64>, address: u64, end: u64) -> Option<(u64, u64)> {
+    heaps
+        .range(..=address)
+        .next_back()
+        .filter(|(start, bytes)| **start + **bytes >= end)
+        .map(|(start, bytes)| (*start, *bytes))
+}
+
+/// Addresses already reported by the root-view diagnostics (once each).
+static REPORTED: Mutex<BTreeMap<u64, ()>> = Mutex::new(BTreeMap::new());
+
+fn resolved_through_heap(address: u64, heap: u64) {
+    let first = REPORTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(address, ())
+        .is_none();
+    if first {
+        tracing::warn!(
+            address = format_args!("{address:#x}"),
+            heap = format_args!("{heap:#x}"),
+            "root view address resolved through heap"
+        );
+    }
+}
+
+/// Whether `address` has not been reported as unresolved yet (once each).
+fn missing_once(address: u64) -> bool {
+    static MISSING: Mutex<BTreeMap<u64, ()>> = Mutex::new(BTreeMap::new());
+    MISSING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(address, ())
+        .is_none()
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -551,6 +642,37 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(end: u64) -> Entry {
+        Entry { end, shadow: None }
+    }
+
+    #[test]
+    fn a_view_deep_in_a_large_buffer_finds_it_past_its_neighbours() {
+        // One 1 MiB buffer, then 100 small buffers above its start that end
+        // before the view: the 64 nearest do not hold the view.
+        let mut map = BTreeMap::new();
+        map.insert((0x1000_0000, 1), entry(0x1010_0000));
+        for i in 0..100u64 {
+            let start = 0x1000_1000 + i * 0x100;
+            map.insert((start, 2 + i as usize), entry(start + 0x80));
+        }
+        let address = 0x1008_0000;
+        assert_eq!(containing(&map, address, address + 4), Some((0x1000_0000, 1)));
+        assert_eq!(containing(&map, 0x2000_0000, 0x2000_0004), None);
+    }
+
+    #[test]
+    fn a_view_in_a_held_heap_is_found_by_its_range() {
+        let mut heaps = BTreeMap::new();
+        heaps.insert(0x2000_0000u64, 0x10000u64);
+        heaps.insert(0x3000_0000u64, 0x1000u64);
+        assert_eq!(heap_in(&heaps, 0x2000_8000, 0x2000_8004), Some((0x2000_0000, 0x10000)));
+        // Past its end, or spanning it, is not in the heap.
+        assert_eq!(heap_in(&heaps, 0x2000_fffc, 0x2001_0004), None);
+        assert_eq!(heap_in(&heaps, 0x2001_0000, 0x2001_0004), None);
+        assert_eq!(heap_in(&heaps, 0x1000, 0x1004), None);
+    }
 
     /// A copy of title memory `[at, at + len)` holding the same bytes, if
     /// there is a host device.
