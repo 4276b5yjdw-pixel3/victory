@@ -463,6 +463,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         if copy.is_none() && missing_once(address) {
             tracing::warn!(
                 address = format_args!("{address:#x}"),
+                state = format_args!("{:#x}", crate::texture::mem_state(address)),
                 "root view address still host None: no buffer, heap or committed memory holds it"
             );
         }

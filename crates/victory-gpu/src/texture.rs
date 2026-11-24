@@ -349,6 +349,17 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// The allocation state of the memory at `at` (`MEM_COMMIT`, `MEM_RESERVE`,
+/// `MEM_FREE`), or 0 if the query fails (diagnostics).
+pub(crate) fn mem_state(at: u64) -> u32 {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 { 0 } else { info.State }
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());

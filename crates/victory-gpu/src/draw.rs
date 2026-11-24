@@ -248,19 +248,31 @@ fn bind_table_view(
     host: &crate::descriptor::host::HostHeap,
     index: u32,
     shadow: &Option<(u64, std::sync::Arc<crate::shadow::Shadow>)>,
+    address: Option<u64>,
     uav: bool,
 ) {
-    let Some((a, s)) = shadow else {
+    let null = |host: &crate::descriptor::host::HostHeap| {
         if uav {
             host.null_raw_uav_at(index);
         } else {
             host.null_raw_at(index);
         }
-        return;
     };
-    // SAFETY: a live buffer.
-    let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-    let offset = s.gpu(*a) - base;
+    let (a, buffer, offset, len) = match (shadow, address) {
+        (Some((a, s)), _) => {
+            // SAFETY: a live buffer.
+            let base = unsafe { s.buffer.GetGPUVirtualAddress() };
+            (*a, s.buffer.clone(), s.gpu(*a) - base, s.left(*a))
+        }
+        // Reserved title memory no buffer holds: its GPU-only range.
+        (None, Some(a)) if crate::texture::mem_state(a) == MEM_RESERVE_STATE => {
+            match crate::gpu_only::view(a) {
+                Some((buffer, offset, len)) => (a, buffer, offset, len),
+                None => return null(host),
+            }
+        }
+        (None, _) => return null(host),
+    };
     let align = if uav { 4 } else { 16 };
     if !offset.is_multiple_of(align) {
         // Raw views start on whole elements; one from the aligned start
@@ -270,17 +282,17 @@ fn bind_table_view(
             uav,
             "a root view not on its element size reads zeros"
         );
-        if uav {
-            host.null_raw_uav_at(index);
-        } else {
-            host.null_raw_at(index);
-        }
-    } else if uav {
-        host.raw_uav_at(index, &s.buffer, offset, s.left(*a));
+        return null(host);
+    }
+    if uav {
+        host.raw_uav_at(index, &buffer, offset, len);
     } else {
-        host.raw_at(index, &s.buffer, offset, s.left(*a));
+        host.raw_at(index, &buffer, offset, len);
     }
 }
+
+/// `MEM_RESERVE` (see [`crate::texture::mem_state`]).
+const MEM_RESERVE_STATE: u32 = 0x2000;
 
 /// Largest root SRV range refreshed per bind.
 const ROOT_SRV_MAX: u64 = 4 << 20;
@@ -873,7 +885,7 @@ impl State {
                 } else {
                     self.root_srv_slots.insert(key, index);
                 }
-                bind_table_view(host, index, &shadow, uav);
+                bind_table_view(host, index, &shadow, address, uav);
                 index
             }
         };
