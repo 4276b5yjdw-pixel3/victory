@@ -27,7 +27,7 @@ use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint cap; };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
@@ -41,16 +41,20 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= records) return;
     uint at = id.x * stride;
     uint cost;
+    // Diagnostics (VICTORY_INDIRECT_MAX_ELEMENTS): a lower per-command
+    // cap on vertex instances and on groups; 0 keeps the defaults.
+    uint lim = cap != 0 ? min(cap, 1u << 26) : 1u << 26;
+    uint groups_max = cap != 0 ? min(cap, GROUPS) : GROUPS;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        uint count = min(args.Load(at), min(1u << 24, lim));
+        uint instances = min(args.Load(at + 4), lim / max(count, 1u));
         cost = count * instances;
         args.Store2(at, uint2(count, instances));
     } else if (kind == 2) {
         uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
         // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+        if (g.z != 0 && g.x * g.y > groups_max / g.z) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
@@ -70,6 +74,19 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 "#;
+
+/// `VICTORY_INDIRECT_MAX_ELEMENTS=<n>` (diagnostics experiment): caps the
+/// vertex instances (vertex count times instances) and the groups of each
+/// indirect command at `n`. 0 (unset, or not a number) keeps the defaults.
+fn element_cap() -> u32 {
+    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_INDIRECT_MAX_ELEMENTS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -160,7 +177,7 @@ pub(crate) fn clamp_uav(
         return false;
     }
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let constants = [kind, stride, records, element_cap()];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {

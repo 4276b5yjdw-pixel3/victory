@@ -32,6 +32,8 @@ pub mod frame;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+#[cfg(feature = "diagnostics")]
+mod indirect_diag;
 mod indirect;
 pub mod list;
 pub mod object;

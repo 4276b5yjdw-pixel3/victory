@@ -116,7 +116,7 @@ impl Shadow {
         address - self.start
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "diagnostics"))]
     pub(crate) fn read_u32(&self, offset: usize) -> u32 {
         assert!(offset + 4 <= self.len as usize);
         // SAFETY: `offset..offset + 4` lies within the mapped host buffer.
@@ -163,6 +163,8 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.left(address));
+        #[cfg(feature = "diagnostics")]
+        crate::indirect_diag::note_write(address, len);
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
