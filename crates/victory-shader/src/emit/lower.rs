@@ -1994,6 +1994,7 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             root_uavs,
+            #[cfg(test)]
             spin_loops: self.spun,
             dxil: self.s.finish(),
             user_data,
