@@ -456,7 +456,8 @@ impl State {
     pub(crate) fn set_index_buffer(&mut self, view: Option<&IndexView>) {
         #[cfg(feature = "diagnostics")]
         if let Some(v) = view {
-            crate::indirect_diag::note_read("index buffer", v.address, u64::from(v.size));
+
+            crate::indirect_diag::note_read("index buffer", v.address, u64::from(v.size), &|| self.op_text(String::from("index view"), false));
         }
         self.index = view.copied().unwrap_or_default();
     }
@@ -1605,6 +1606,7 @@ impl State {
             (kind, stride, max),
             arguments,
             counter.as_ref().map(|(s, at)| (&**s, s.offset(*at))),
+            &|| self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH),
         );
         if crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.has_root_uavs())
         {

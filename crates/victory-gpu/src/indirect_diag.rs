@@ -62,11 +62,12 @@ pub(crate) fn note_exec(
     (kind, stride, max): (u32, u32, u32),
     arguments: u64,
     counter: Option<(&Shadow, u64)>,
+    text: &dyn Fn() -> String,
 ) {
     if !on() {
         return;
     }
-    note_read("indirect arguments", arguments, u64::from(stride) * u64::from(max));
+    note_read("indirect arguments", arguments, u64::from(stride) * u64::from(max), text);
     let records = max.min(RECORDS);
     let bytes = (records as usize) * (stride as usize);
     let frame = frame();
@@ -209,7 +210,7 @@ static HITS: AtomicU64 = AtomicU64::new(0);
 /// A read of `[address, address + len)` by `what` (index buffer, indirect
 /// arguments or count): on a listed frame, logged when it overlaps a range
 /// the shaders wrote on that frame (the consumer of a compute pass's output).
-pub(crate) fn note_read(what: &str, address: u64, len: u64) {
+pub(crate) fn note_read(what: &str, address: u64, len: u64, text: &dyn Fn() -> String) {
     if !on() {
         return;
     }
@@ -225,6 +226,7 @@ pub(crate) fn note_read(what: &str, address: u64, len: u64) {
                 what,
                 read = format_args!("{address:#x}+{len:#x}"),
                 written = format_args!("{start:#x}+{wlen:#x}"),
+                op = %text(),
                 "read of a range shaders wrote"
             );
         }
