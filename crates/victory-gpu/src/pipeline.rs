@@ -333,6 +333,40 @@ impl Shader {
     }
 }
 
+/// The name the console's ray-tracing BVH builder gives its shaders: their
+/// containers carry it in debug paths (`XboxBvhBuilder/<kernel>`).
+pub(crate) const BVH_BUILDER_MARKER: &[u8] = b"XboxBvhBuilder";
+
+/// Whether a console container names the BVH builder (its bytes contain
+/// the marker, in any part).
+pub(crate) fn names_bvh_builder(container: &[u8]) -> bool {
+    container
+        .windows(BVH_BUILDER_MARKER.len())
+        .any(|w| w == BVH_BUILDER_MARKER)
+}
+
+/// `VICTORY_SKIP_BVH_BUILDER=1` (diagnostics): draws and dispatches using a
+/// BVH builder shader are dropped. Each such shader's hash is logged once.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skip_bvh() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SKIP_BVH_BUILDER").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn bvh_skipped(shader: &Shader) -> bool {
+    static LOGGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    if !skip_bvh() || !names_bvh_builder(&shader.container) {
+        return false;
+    }
+    let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    if !logged.iter().any(|h| *h == shader.hash) {
+        tracing::warn!(stage = shader.stage, hash = %shader.hash, "BVH builder shader: dropped");
+        logged.push(shader.hash.clone());
+    }
+    true
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
@@ -345,13 +379,15 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         let value = std::env::var("VICTORY_SKIP_WAVE64").unwrap_or_default();
         parse_skip_stages(&value)
     });
-    if hashes.is_empty() && wave64.is_empty() {
+    if hashes.is_empty() && wave64.is_empty() && !skip_bvh() {
         return None;
     }
     p.shaders
         .iter()
         .find(|shader| {
-            hashes.contains(&shader.hash) || (wave64.contains(&shader.stage) && shader.wave64())
+            hashes.contains(&shader.hash)
+                || (wave64.contains(&shader.stage) && shader.wave64())
+                || bvh_skipped(shader)
         })
         .map(|shader| shader.hash.as_str())
 }
@@ -763,5 +799,23 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod bvh_builder_tests {
+    use super::names_bvh_builder;
+
+    #[test]
+    fn marker_in_debug_path_is_bvh_builder() {
+        let container = b"DXBC\0\0XboxBvhBuilder/ResetToIndexBuffer\0tail";
+        assert!(names_bvh_builder(container));
+    }
+
+    #[test]
+    fn other_containers_are_not_bvh_builder() {
+        assert!(!names_bvh_builder(b"DXBC\0\0shader/main.hlsl\0"));
+        assert!(!names_bvh_builder(b""));
+        assert!(!names_bvh_builder(b"XboxBvhBuild"));
     }
 }
