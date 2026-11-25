@@ -84,7 +84,7 @@ fn build_with(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
-        samplers: lowered.samplers,
+        samplers: lowered.samplers.iter().map(|&(w, _)| w).collect(),
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
