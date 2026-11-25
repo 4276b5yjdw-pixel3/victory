@@ -556,9 +556,9 @@ const TILE: u64 = 64 << 10;
 /// packed part, tile 0 of each slice; tilings list the standard mips of
 /// subresource (`mip + slice * mips`, as D3D12 counts them), zeroed for the
 /// packed mips. Measured against Microsoft's xg_xs.dll (offline PC build
-/// 10.0.26100.6247): with a tail it lists `standard * slices` entries less
-/// `first` up to `standard` (its count stops short for arrays of more than
-/// eight slices; the title reads slice 0 only).
+/// 10.0.26100.6247): it fills the room from `first` on and counts the
+/// standard mips whose subresource falls in it (with 16 entries of room, as
+/// the title passes, two slices of an array with a tail).
 extern "system" fn tiling_ours(
     this: This,
     tiles: *mut u32,
@@ -601,15 +601,12 @@ extern "system" fn tiling_ours(
             *s = [l.block[0] * block, l.block[1] * block, l.block[2]];
         }
         if let Some(n) = count.as_mut() {
-            let (total, skipped) = if standard < c.mips {
-                (standard * l.slices, first.min(standard))
-            } else {
-                (c.mips * l.slices, first)
-            };
-            let wanted = total.saturating_sub(skipped).min(*n);
-            for i in 0..wanted {
+            let room = (c.mips * l.slices).saturating_sub(first).min(*n);
+            let mut standard_in_room = 0;
+            for i in 0..room {
                 let (slice, mip) = ((first + i) / c.mips, (first + i) % c.mips);
                 let entry = if mip < standard && slice < l.slices {
+                    standard_in_room += 1;
                     let m = &l.mips[mip as usize];
                     SubresourceTiling {
                         width: m.pitch / l.block[0],
@@ -627,7 +624,7 @@ extern "system" fn tiling_ours(
                 };
                 out.add(i as usize).write(entry);
             }
-            *n = wanted;
+            *n = standard_in_room;
         }
     }
     S_OK
@@ -982,9 +979,12 @@ mod tests {
         );
         // Indexed by subresource: slice 0's two standard mips, then its
         // packed mips, zeroed.
-        assert_eq!((hr, n), (S_OK, 6));
+        // Room for 8 of the 21 subresources: slice 0's standard mips (0, 1),
+        // its packed mips zeroed, slice 1's mip 0 (7): three standard mips.
+        assert_eq!((hr, n), (S_OK, 3));
         assert!(subs[..2].iter().all(|s| s.depth == 1));
-        assert!(subs[2..6].iter().all(|s| s.depth == 0 && s.start == 0));
+        assert!(subs[2..7].iter().all(|s| s.depth == 0 && s.start == 0));
+        assert_eq!(subs[7].depth, 1);
         assert_eq!(release(c), 0);
     }
 
@@ -1031,18 +1031,17 @@ mod tests {
                 "{d:?}"
             );
             if a.alignment == TILE {
-                for first in 0..3 {
+                for (first, room) in (0..3).flat_map(|f| [(f, 16), (f, 64)]) {
                     let ((hr, n, ours), (real_hr, real_n, theirs)) =
-                        (tilings(c, first), real_tilings(real, first));
+                        (tilings(c, first, room), real_tilings(real, first, room));
                     let common = n.min(real_n) as usize;
-                    assert_eq!(hr, real_hr, "{d:?} first {first}");
-                    assert_eq!(ours[..common], theirs[..common], "{d:?} first {first}");
-                    // shortcut: the library's count stops short of ours for
-                    // arrays with a tail and more than three slices (rule not
-                    // found); the title reads slice 0 only.
-                    if d.depth_or_array <= 3 || a.plane[0].tail_mips == 0 {
-                        assert_eq!(n, real_n, "{d:?} first {first}");
-                    }
+                    assert_eq!(hr, real_hr, "{d:?} first {first} room {room}");
+                    assert_eq!(
+                        ours[..common],
+                        theirs[..common],
+                        "{d:?} first {first} room {room}"
+                    );
+                    assert_eq!(n, real_n, "{d:?} first {first} room {room}");
                 }
             }
             o.release(real);
@@ -1053,14 +1052,14 @@ mod tests {
 
     type Tilings = (HRESULT, u32, Vec<SubresourceTiling>);
 
-    fn tilings(c: This, first: u32) -> Tilings {
+    fn tilings(c: This, first: u32, room: u32) -> Tilings {
         let zero = SubresourceTiling {
             width: 0,
             height: 0,
             depth: 0,
             start: 0,
         };
-        let (mut subs, mut n) = (vec![zero; 64], 64u32);
+        let (mut subs, mut n) = (vec![zero; room as usize], room);
         let null = std::ptr::null_mut::<u8>();
         let hr = tiling_ours(
             c,
@@ -1075,16 +1074,16 @@ mod tests {
         (hr, n, subs)
     }
 
-    fn real_tilings(real: *mut c_void, first: u32) -> Tilings {
+    fn real_tilings(real: *mut c_void, first: u32, room: u32) -> Tilings {
         let zero = SubresourceTiling {
             width: 0,
             height: 0,
             depth: 0,
             start: 0,
         };
-        let (mut subs, mut n) = (vec![zero; 64], 64u32);
+        let (mut subs, mut n) = (vec![zero; room as usize], room);
         let null = std::ptr::null_mut::<u8>();
-        // SAFETY: a live real computer and room for 64 entries.
+        // SAFETY: a live real computer and room for `room` entries.
         let hr = unsafe {
             xg_oracle::slot::<xg_oracle::Tiling>(real, xg_oracle::SLOT_TILING)(
                 real,
