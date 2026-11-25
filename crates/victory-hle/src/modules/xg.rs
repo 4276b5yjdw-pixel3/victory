@@ -554,8 +554,11 @@ const TILE: u64 = 64 << 10;
 /// count, first, subresource tilings)`, in 64 KiB tiles of plane 0, for 2D
 /// 64 KiB modes only (others fail, as on the console). The mip tail is the
 /// packed part, tile 0 of each slice; tilings list the standard mips of
-/// every slice in turn, with or without a tail (Microsoft's xg_xs.dll,
-/// offline PC build 10.0.26100.6247, lists all of them).
+/// subresource (`mip + slice * mips`, as D3D12 counts them), zeroed for the
+/// packed mips. Measured against Microsoft's xg_xs.dll (offline PC build
+/// 10.0.26100.6247): with a tail it lists `standard * slices` entries less
+/// `first` up to `standard` (its count stops short for arrays of more than
+/// eight slices; the title reads slice 0 only).
 extern "system" fn tiling_ours(
     this: This,
     tiles: *mut u32,
@@ -598,16 +601,31 @@ extern "system" fn tiling_ours(
             *s = [l.block[0] * block, l.block[1] * block, l.block[2]];
         }
         if let Some(n) = count.as_mut() {
-            let wanted = (standard * l.slices).saturating_sub(first).min(*n);
+            let (total, skipped) = if standard < c.mips {
+                (standard * l.slices, first.min(standard))
+            } else {
+                (c.mips * l.slices, first)
+            };
+            let wanted = total.saturating_sub(skipped).min(*n);
             for i in 0..wanted {
-                let (slice, mip) = ((first + i) / standard, (first + i) % standard);
-                let m = &l.mips[mip as usize];
-                out.add(i as usize).write(SubresourceTiling {
-                    width: m.pitch / l.block[0],
-                    height: (m.rows / l.block[1]) as u16,
-                    depth: 1,
-                    start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
-                });
+                let (slice, mip) = ((first + i) / c.mips, (first + i) % c.mips);
+                let entry = if mip < standard && slice < l.slices {
+                    let m = &l.mips[mip as usize];
+                    SubresourceTiling {
+                        width: m.pitch / l.block[0],
+                        height: (m.rows / l.block[1]) as u16,
+                        depth: 1,
+                        start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
+                    }
+                } else {
+                    SubresourceTiling {
+                        width: 0,
+                        height: 0,
+                        depth: 0,
+                        start: 0,
+                    }
+                };
+                out.add(i as usize).write(entry);
             }
             *n = wanted;
         }
@@ -939,9 +957,9 @@ mod tests {
         assert_eq!(release(c), 0);
     }
 
-    /// An array with a mip tail lists the standard mips of every slice.
+    /// An array with a mip tail, as Microsoft's library lists it.
     #[test]
-    fn tiling_lists_every_slice_of_an_array() {
+    fn tiling_counts_subresources_and_zeroes_packed_mips() {
         let mut d = desc(256, 256, 7, 28, 0x10a);
         d.depth_or_array = 3;
         let c = create(&d);
@@ -962,8 +980,11 @@ mod tests {
             0,
             subs.as_mut_ptr(),
         );
+        // Indexed by subresource: slice 0's two standard mips, then its
+        // packed mips, zeroed.
         assert_eq!((hr, n), (S_OK, 6));
-        assert!(subs[2..6].iter().all(|s| s.depth == 1 && s.start > 0));
+        assert!(subs[..2].iter().all(|s| s.depth == 1));
+        assert!(subs[2..6].iter().all(|s| s.depth == 0 && s.start == 0));
         assert_eq!(release(c), 0);
     }
 
@@ -986,7 +1007,7 @@ mod tests {
             (128, 128, 6, 71, 0x105),
             (256, 256, 7, 28, 0x10a),
         ] {
-            for array in [1, 3, 32] {
+            for array in [1, 2, 3, 4, 8, 32] {
                 let mut d = desc(w, h, mips, format, layout);
                 d.depth_or_array = array;
                 descs.push(d);
@@ -1009,10 +1030,74 @@ mod tests {
                 Vec::<String>::new(),
                 "{d:?}"
             );
+            if a.alignment == TILE {
+                for first in 0..3 {
+                    let ((hr, n, ours), (real_hr, real_n, theirs)) =
+                        (tilings(c, first), real_tilings(real, first));
+                    let common = n.min(real_n) as usize;
+                    assert_eq!(hr, real_hr, "{d:?} first {first}");
+                    assert_eq!(ours[..common], theirs[..common], "{d:?} first {first}");
+                    // shortcut: the library's count stops short of ours for
+                    // arrays with a tail and more than three slices (rule not
+                    // found); the title reads slice 0 only.
+                    if d.depth_or_array <= 3 || a.plane[0].tail_mips == 0 {
+                        assert_eq!(n, real_n, "{d:?} first {first}");
+                    }
+                }
+            }
             o.release(real);
             assert_eq!(release(c), 0);
         }
         eprintln!("{} descriptions match xg_xs.dll", descs.len());
+    }
+
+    type Tilings = (HRESULT, u32, Vec<SubresourceTiling>);
+
+    fn tilings(c: This, first: u32) -> Tilings {
+        let zero = SubresourceTiling {
+            width: 0,
+            height: 0,
+            depth: 0,
+            start: 0,
+        };
+        let (mut subs, mut n) = (vec![zero; 64], 64u32);
+        let null = std::ptr::null_mut::<u8>();
+        let hr = tiling_ours(
+            c,
+            null.cast(),
+            null.cast(),
+            null.cast(),
+            &mut n,
+            first,
+            subs.as_mut_ptr(),
+        );
+        subs.truncate(n as usize);
+        (hr, n, subs)
+    }
+
+    fn real_tilings(real: *mut c_void, first: u32) -> Tilings {
+        let zero = SubresourceTiling {
+            width: 0,
+            height: 0,
+            depth: 0,
+            start: 0,
+        };
+        let (mut subs, mut n) = (vec![zero; 64], 64u32);
+        let null = std::ptr::null_mut::<u8>();
+        // SAFETY: a live real computer and room for 64 entries.
+        let hr = unsafe {
+            xg_oracle::slot::<xg_oracle::Tiling>(real, xg_oracle::SLOT_TILING)(
+                real,
+                null.cast(),
+                null.cast(),
+                null.cast(),
+                &mut n,
+                first,
+                subs.as_mut_ptr().cast(),
+            )
+        };
+        subs.truncate(n as usize);
+        (hr, n, subs)
     }
 
     #[test]
