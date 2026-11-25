@@ -81,7 +81,8 @@ pub fn get() -> Option<&'static Oracle> {
 fn load() -> Option<Oracle> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::LibraryLoader::{
-        GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW,
+        GetProcAddress, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+        LoadLibraryExW,
     };
     let path = std::env::var_os("VICTORY_XG_DLL")?;
     let wide: Vec<u16> = path.encode_wide().chain(Some(0)).collect();
@@ -91,11 +92,13 @@ fn load() -> Option<Oracle> {
         LoadLibraryExW(
             wide.as_ptr(),
             std::ptr::null_mut(),
-            LOAD_WITH_ALTERED_SEARCH_PATH,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
         )
     };
     if module.is_null() {
-        tracing::error!(?path, "xg oracle: the library did not load");
+        // SAFETY: no precondition.
+        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        tracing::error!(?path, error, "xg oracle: the library did not load");
         return None;
     }
     // SAFETY: exports of the loaded module.

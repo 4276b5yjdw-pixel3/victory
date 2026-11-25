@@ -263,17 +263,6 @@ const _: () = assert!(size_of::<MipOut>() == 0x70);
 const _: () = assert!(size_of::<PlaneOut>() == 0x6c8);
 const _: () = assert!(size_of::<LayoutOut>() == 0x1b40);
 
-/// The mode a tail mip is reported in: the 256-byte one of its kind (3 for
-/// the render kind, which GFX10 lacks), the depth mode itself.
-fn tail_swizzle(swizzle: Swizzle) -> u32 {
-    match swizzle.0 {
-        2 | 6 | 10 | 18 | 22 | 26 => Swizzle::SW_256B_D.0,
-        23 | 27 => 3,
-        24 => swizzle.0,
-        _ => Swizzle::SW_256B_S.0,
-    }
-}
-
 fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
     let m = &l.mips[i];
     let bpe = u64::from(l.desc.element_bytes);
@@ -302,13 +291,16 @@ fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
             out.swizzle = l.desc.swizzle.0;
         }
         Some(t) => {
+            // As Microsoft's xg_xs.dll reports a tail mip (measured against
+            // its offline PC build, 10.0.26100.6247): in the texture's own
+            // mode, at its element position in the tail block.
             out.in_tail = 1;
             out.alignment = 256;
-            out.swizzle = tail_swizzle(l.desc.swizzle);
+            out.swizzle = l.desc.swizzle.0;
+            out.tail_position = t.x | t.y << 11;
             if l.thick {
                 // A 3D tail mip is placed by position, not by offset.
                 out.slice_size = l.alignment / u64::from(l.block[2]);
-                out.tail_position = t.x | t.y << 11;
             } else {
                 out.offset = u64::from(t.offset);
                 out.slice_size = slice;
@@ -562,9 +554,8 @@ const TILE: u64 = 64 << 10;
 /// count, first, subresource tilings)`, in 64 KiB tiles of plane 0, for 2D
 /// 64 KiB modes only (others fail, as on the console). The mip tail is the
 /// packed part, tile 0 of each slice; tilings list the standard mips of
-/// every slice in turn. With a tail the console's library lists two slices
-/// at most and zeroes all but the first; so do we (the title reads slice 0
-/// only).
+/// every slice in turn, with or without a tail (Microsoft's xg_xs.dll,
+/// offline PC build 10.0.26100.6247, lists all of them).
 extern "system" fn tiling_ours(
     this: This,
     tiles: *mut u32,
@@ -583,7 +574,6 @@ extern "system" fn tiling_ours(
         return E_NOTIMPL;
     }
     let standard = l.first_tail_mip;
-    let tail = standard < c.mips;
     let tail_tiles = match standard {
         0 => l.slice_size / TILE,
         s if s < c.mips => l.mips[s as usize - 1].offset / TILE,
@@ -608,27 +598,16 @@ extern "system" fn tiling_ours(
             *s = [l.block[0] * block, l.block[1] * block, l.block[2]];
         }
         if let Some(n) = count.as_mut() {
-            let slices = if tail { l.slices.min(2) } else { l.slices };
-            let wanted = (standard * slices).saturating_sub(first).min(*n);
+            let wanted = (standard * l.slices).saturating_sub(first).min(*n);
             for i in 0..wanted {
                 let (slice, mip) = ((first + i) / standard, (first + i) % standard);
                 let m = &l.mips[mip as usize];
-                let entry = if tail && slice > 0 {
-                    SubresourceTiling {
-                        width: 0,
-                        height: 0,
-                        depth: 0,
-                        start: 0,
-                    }
-                } else {
-                    SubresourceTiling {
-                        width: m.pitch / l.block[0],
-                        height: (m.rows / l.block[1]) as u16,
-                        depth: 1,
-                        start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
-                    }
-                };
-                out.add(i as usize).write(entry);
+                out.add(i as usize).write(SubresourceTiling {
+                    width: m.pitch / l.block[0],
+                    height: (m.rows / l.block[1]) as u16,
+                    depth: 1,
+                    start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
+                });
             }
             *n = wanted;
         }
@@ -873,6 +852,9 @@ mod tests {
         assert_eq!((p.standard_mips, p.tail_mips, p.element_bytes), (1, 8, 16));
         assert_eq!((p.mips[0].offset, p.mips[0].pitch_bytes), (65536, 1024));
         assert_eq!((p.mips[1].offset, p.mips[1].in_tail), (32768, 1));
+        // A tail mip in the texture's own mode, at x 32 of the tail block.
+        assert_eq!((p.mips[1].swizzle, p.mips[1].tail_position), (10, 32));
+        assert_eq!((p.mips[2].swizzle, p.mips[2].tail_position), (10, 32 << 11));
 
         type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
         type From =
@@ -955,6 +937,82 @@ mod tests {
             E_FAIL
         );
         assert_eq!(release(c), 0);
+    }
+
+    /// An array with a mip tail lists the standard mips of every slice.
+    #[test]
+    fn tiling_lists_every_slice_of_an_array() {
+        let mut d = desc(256, 256, 7, 28, 0x10a);
+        d.depth_or_array = 3;
+        let c = create(&d);
+        let zero = SubresourceTiling {
+            width: 0,
+            height: 0,
+            depth: 0,
+            start: 0,
+        };
+        let mut subs = [zero; 8];
+        let (mut n, null) = (8u32, std::ptr::null_mut::<u8>());
+        let hr = tiling(
+            c,
+            null.cast(),
+            null.cast(),
+            null.cast(),
+            &mut n,
+            0,
+            subs.as_mut_ptr(),
+        );
+        assert_eq!((hr, n), (S_OK, 6));
+        assert!(subs[2..6].iter().all(|s| s.depth == 1 && s.start > 0));
+        assert_eq!(release(c), 0);
+    }
+
+    /// With `VICTORY_XG_DLL` naming Microsoft's library, our layouts and
+    /// tilings of the descriptions Grand Theft Auto VI uses match its own.
+    #[test]
+    fn matches_microsofts_library_when_present() {
+        let Some(o) = xg_oracle::get() else {
+            return;
+        };
+        let mut descs = Vec::new();
+        for (w, h, mips, format, layout) in [
+            (256, 256, 9, 98, 0x10a),
+            (256, 256, 9, 83, 0x10a),
+            (256, 256, 9, 71, 0x10a),
+            (512, 512, 10, 98, 0x10a),
+            (2048, 1024, 9, 98, 0x10a),
+            (1024, 2048, 9, 99, 0x10a),
+            (512, 512, 10, 98, 0x105),
+            (128, 128, 6, 71, 0x105),
+            (256, 256, 7, 28, 0x10a),
+        ] {
+            for array in [1, 3, 32] {
+                let mut d = desc(w, h, mips, format, layout);
+                d.depth_or_array = array;
+                descs.push(d);
+            }
+        }
+        for d in &descs {
+            let c = create(d);
+            let real = o.computer(d);
+            assert!(!real.is_null(), "{d:?}");
+            // SAFETY: plain data, filled by the calls.
+            let (mut a, mut b): (Box<LayoutOut>, Box<LayoutOut>) =
+                unsafe { (Box::new(std::mem::zeroed()), Box::new(std::mem::zeroed())) };
+            layout(c, &mut *a);
+            // SAFETY: a live real computer.
+            let get: extern "system" fn(*mut c_void, *mut LayoutOut) -> HRESULT =
+                unsafe { xg_oracle::slot(real, 2) };
+            get(real, &mut *b);
+            assert_eq!(
+                xg_oracle::layout_diffs(&a, &b),
+                Vec::<String>::new(),
+                "{d:?}"
+            );
+            o.release(real);
+            assert_eq!(release(c), 0);
+        }
+        eprintln!("{} descriptions match xg_xs.dll", descs.len());
     }
 
     #[test]
