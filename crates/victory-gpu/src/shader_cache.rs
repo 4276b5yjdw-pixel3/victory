@@ -78,7 +78,6 @@ fn build() -> &'static [u8; 32] {
         }
         key.update(&limit.to_le_bytes());
         key.update(&[victory_shader::emit::group_sync()]);
-        key.update(&victory_shader::emit::shader_opt().to_le_bytes());
         for name in [
             "VICTORY_WAVE_WIDE",
             "VICTORY_WAVE_DEEP_SKIPS",
